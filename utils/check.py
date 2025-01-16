@@ -3,11 +3,13 @@ import hashlib
 import re
 import contextlib
 
-import pyrogram.types
+from pyrogram import Client
+from pyrogram.enums import ChatAction
 from pyrogram.types import Message, CallbackQuery
 from pyrogram.errors import RPCError, MessageDeleteForbidden
 from loguru import logger
 from pyrogram.filters import private_filter
+
 from botmodule.init_bot import config
 from utils.cron.utils import message_delete_queue
 
@@ -23,15 +25,19 @@ def get_telegram_id_from_message(message: Message):
     :param message:
     :return:
     """
-    # print(message)
+    ID = -1
     try:
-        ID = message.from_user.id
+        if message and message.from_user:
+            ID = message.from_user.id
+        elif message and message.sender_chat:
+            ID = message.sender_chat.id
         return ID
     except AttributeError:
         ID = message.sender_chat.id
         return ID
     except Exception as e:
         logger.error(str(e))
+        return ID
 
 
 get_id = get_telegram_id_from_message  # 别名
@@ -55,6 +61,8 @@ async def is_port_in_use(host='127.0.0.1', port=80):
 
 
 async def check_port(start: int, end: int):
+    if start > end:
+        start, end = end, start
     tasks = []
     for i in range(start, end):
         tasks.append(asyncio.create_task(is_port_in_use(port=i)))
@@ -130,7 +138,6 @@ async def check_node(backmsg: Message, core, nodenum: int) -> bool:
             await backmsg.edit_text("⚠️节点数量超出限制，已取消测试。")
             flag = True
     if flag:
-        message_delete_queue.put_nowait((backmsg.chat.id, backmsg.id, 10))
         return True
     return False
 
@@ -175,6 +182,14 @@ async def check_subowner(message, back_message, subinfo: dict, admin: list, pass
         return False
 
 
+def check_sub_name(subname: str) -> bool:
+    """
+    预先检查订阅名
+    """
+    sub = config.get_sub(subname)
+    return bool(sub)
+
+
 async def check_user(message, USER_TARGET: list, isalert=True):
     """
     检查是否是用户，如果是返回真
@@ -212,8 +227,6 @@ async def check_user(message, USER_TARGET: list, isalert=True):
                 if isalert:
                     m2 = await message.reply("⚠️您似乎没有使用权限，请联系bot的管理员获取授权")
                     message_delete_queue.put_nowait((m2.chat.id, m2.id, 10))
-                    # await asyncio.sleep(10)
-                    # await m2.delete()
                 return False
             else:
                 return True
@@ -222,31 +235,9 @@ async def check_user(message, USER_TARGET: list, isalert=True):
             if isalert:
                 m2 = await message.reply("⚠️您似乎没有使用权限，请联系bot的管理员获取授权")
                 message_delete_queue.put_nowait((m2.chat.id, m2.id, 10))
-                # await asyncio.sleep(10)
-                # await m2.delete()
             return False
         else:
             return True
-
-
-async def check_number(message, test_member, max_num=4):
-    """
-    检查任务数量
-    :param message: 消息对象
-    :param test_member: 当前任务数量
-    :param max_num: 最大测试数量
-    :return: bool
-    """
-    try:
-        if test_member > max_num:
-            await message.edit_text("⚠️测试任务数量达到最大，请等待一个任务完成。\n提示：可用 /reload 命令重置此状态")
-            return True
-        if test_member > 1:
-            logger.warning("注意，当前测试任务数量大于1，处于多任务同测状态，可能会对测试结果产生影响")
-            await message.reply("⚠️注意，当前测试任务数量大于1，处于多任务同测状态，可能会对测试结果产生影响")
-        return False
-    except RPCError as r:
-        logger.error(r)
 
 
 async def check_url(message, url):
@@ -260,8 +251,6 @@ async def check_url(message, url):
         try:
             m2 = await message.edit_text("⚠️无效的订阅地址，请检查后重试。")
             message_delete_queue.put_nowait((m2.chat.id, m2.id, 10))
-            # await asyncio.sleep(10)
-            # await m2.delete()
         except RPCError as r:
             logger.error(r)
         return True
@@ -363,33 +352,54 @@ async def check_speed_nodes(message, nodenum, args: tuple, speed_max_num=config.
         return False
 
 
-async def check_photo(message: pyrogram.types.Message, back_message, name, wtime, size: tuple = None):
+async def check_photo(app: "Client", msg_id: int, botmsg_id: int, chat_id: int, name: str, wtime: str,
+                      size: tuple = None):
     """
     检查图片是否生成成功
+    :param app: bot客户端
     :param wtime: 消耗时间
-    :param message: 消息对象
-    :param back_message: 消息对象
+    :param msg_id: 发起任务的消息id
+    :param botmsg_id: bot消息id
+    :param chat_id: 对话id
     :param name: 图片名
     :param size: 图片大小
     :return:
     """
+    image_name = fr'./results/{name}.png'
+    caption = f"⏱️总共耗时: {wtime}s"
     try:
         if name == '' or name is None:
-            await back_message.edit_text("⚠️生成图片失败,可能原因: 节点过多/网络不稳定")
+            await app.edit_message_text(chat_id, botmsg_id, "⚠️生成图片失败,可能原因: 节点过多/网络不稳定")
+            # await back_message.edit_text("⚠️生成图片失败,可能原因: 节点过多/网络不稳定")
         else:
             x, y = size if size is not None else (0, 0)
             if x > 0 and y > 0:
                 if x < 2500 and y < 3500:
-                    await message.reply_photo(fr'./results/{name}.png', caption=f"⏱️总共耗时: {wtime}s")
+                    await app.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
+                    await app.send_photo(chat_id, image_name, caption=f"⏱️总共耗时: {wtime}s",
+                                         reply_to_message_id=msg_id)
+                    # await message.reply_photo(fr'./results/{name}.png', caption=f"⏱️总共耗时: {wtime}s")
                 else:
-                    await message.reply_document(fr"./results/{name}.png", caption=f"⏱️总共耗时: {wtime}s")
+                    await app.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
+                    await app.send_document(chat_id, image_name, caption=caption, reply_to_message_id=msg_id)
+                    # await message.reply_document(fr"./results/{name}.png", caption=f"⏱️总共耗时: {wtime}s")
             else:
-                await message.reply_document(fr"./results/{name}.png", caption=f"⏱️总共耗时: {wtime}s")
-            await back_message.delete()
-            if not await private_filter(name, name, message):
-                with contextlib.suppress(MessageDeleteForbidden):
-                    await message.delete()
+                await app.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
+                await app.send_document(chat_id, image_name, caption=caption, reply_to_message_id=msg_id)
+                # await message.reply_document(fr"./results/{name}.png", caption=f"⏱️总共耗时: {wtime}s")
+            try:
+                bot_msg = await app.get_messages(chat_id, botmsg_id)
+                await bot_msg.delete()
+                msg = await app.get_messages(chat_id, msg_id)
+                if not await private_filter(name, name, msg):
+                    with contextlib.suppress(MessageDeleteForbidden, AttributeError):
+                        await msg.delete()
+            except ValueError:
+                pass
+
     except RPCError as r:
+        if chat_id:
+            await app.send_document(chat_id, image_name, caption=caption)
         logger.error(r)
 
 
@@ -413,28 +423,3 @@ def checkIPv4(ip):
         if _ip.group(0) == ip:
             return True
     return False
-
-
-# 已废弃
-async def progress(message, prog, *args):
-    """
-    进度反馈，bot负责发送给TG前端
-    :param message:
-    :param prog: 已完成节点数量
-    :param args:
-    :return:
-    """
-    try:
-        nodenum = args[0]
-        cal = args[1]
-        try:
-            subtext = args[2]
-        except IndexError:
-            subtext = ""
-        p_text = f"{subtext}\n\n当前进度:\n" + "%.2f" % cal + "%     [" + str(prog) + "/" + str(nodenum) + "]"
-        try:
-            await message.edit_text(p_text)  # 实时反馈进度
-        except RPCError as r:
-            logger.error(str(r))
-    except Exception as e:
-        logger.error(str(e))

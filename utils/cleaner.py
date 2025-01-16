@@ -1,8 +1,14 @@
 import asyncio
+import contextlib
+import gzip
 import importlib
 import os
-import re
-import sys
+import pathlib
+import tarfile
+import shutil
+
+from copy import deepcopy
+from pathlib import Path
 from typing import Union, List
 import socket
 
@@ -10,10 +16,12 @@ import yaml
 from loguru import logger
 
 try:
-    import re2
+    import re2 as re
 
-    remodule = re2
+    remodule = re
 except ImportError:
+    import re
+
     remodule = re
 
 
@@ -145,7 +153,7 @@ class AddonCleaner:
     动态脚本导入
     """
 
-    def __init__(self, path: str = "./addons/"):
+    def __init__(self, path: str = "addons"):
         """
         模块管理中心
         :param path: 加载路径
@@ -153,15 +161,14 @@ class AddonCleaner:
         self.path = path
         self._script = {}
         self.blacklist = []
+        self.module_suffixes = [".py", ".pyd", ".so", ".dll"]
 
     def global_test_item(self, httptest: bool = False):
         """
         经过去重并支持黑名单一并去除。最后返回一个新列表
         :return:
         """
-        base_item = ['Netflix', 'Youtube', 'Disney+', 'OpenAI', 'Viu', 'steam货币', 'TVB',
-                     '维基百科', '落地IP风险']
-        base_item = base_item + list(self._script.keys())
+        base_item = list(self._script.keys())
         new_item = sorted(set(base_item) - set(self.blacklist), key=base_item.index)
         if httptest:
             new_item.insert(0, "HTTP(S)延迟")
@@ -171,7 +178,10 @@ class AddonCleaner:
     def script(self):
         return self._script
 
-    def reload_script(self, blacklist: list = None, path: str = "./addons/"):
+    def reload_script(self, blacklist: list = None, path: Union[str, List[str]] = None):
+        if path is None:
+            path = ["addons/builtin", "addons"]
+        path = [path] if isinstance(path, str) else path
         self.init_addons(path)
         if blacklist:
             for b in blacklist:
@@ -191,10 +201,11 @@ class AddonCleaner:
         success_list = []
         if script_name:
             for name in script_name:
-                if name[-3:] == '.py' and name != "__init__.py":
+                sname = str(name).removesuffix(".py")
+                if name == "__init__.py":
                     continue
                 try:
-                    os.remove(self.path + name + '.py')
+                    os.remove(Path(self.path).joinpath(f"{sname}.py"))
                     success_list.append(name)
                 except FileNotFoundError as f:
                     logger.warning(f"{name} 文件不存在\t" + str(f))
@@ -207,101 +218,89 @@ class AddonCleaner:
             logger.warning("script_name is empty")
             return success_list
 
-    def init_addons(self, path: str, package: str = "addons"):
+    def init_addons(self, package: Union[str, List[str]] = "addons"):
         """
         动态加载测速脚本
         """
-        module_suffix = ["py", "pyd", "so", "dll"]
-        try:
-            # path = os.path.abspath(path)
-            di = os.listdir(path)
-        except FileNotFoundError:
-            di = None
-        module_name = []
-        if di is None:
-            logger.warning(f"找不到 {path} 所在的路径")
-        else:
-            for d in di:
-                if len(d) > 3:
-                    e = d.split('.')
-                    if len(e) < 1:
-                        continue
-                    if e[-1] in module_suffix and d != "__init__.py":
-                        module_name.append(e[0])
-                    else:
-                        pass
         self._script.clear()
-        logger.info("模块即将动态加载: " + str(module_name))
-        # module_name = ["abema"]
+        packages = [package] if isinstance(package, str) else package
         num = 0
-        for mname in module_name:
-            try:
-                mo1 = importlib.import_module(f".{mname}", package=package)
-            except ModuleNotFoundError as m:
-                logger.warning(str(m))
-                mo1 = None
-            except NameError as n:
-                logger.warning(str(n))
-                mo1 = None
-            except Exception as e:
-                logger.error(str(e))
-                mo1 = None
-            if mo1 is None:
-                continue
-            try:
-                script = getattr(mo1, 'SCRIPT')
-            except AttributeError:
-                script = None
-            if script is None or not isinstance(script, dict):
-                continue
 
+        def unsafe_load(name: str, pkg: str) -> bool:
+            try:
+                mod = importlib.import_module(str(pathlib.Path(pkg).joinpath(name).as_posix().replace('/', '.')))
+            except (ModuleNotFoundError, NameError, Exception):
+                mod = None
+            if mod is None:
+                return False
+            script = getattr(mod, 'SCRIPT', None)
+            if script is None or not isinstance(script, dict):
+                return False
             sname = script.get('MYNAME', None)
             stask = script.get("TASK", None)
             sget = script.get("GET", None)
-            if callable(stask) and isinstance(sname, str) and callable(sget):
-                self._script[sname] = [stask, sget]
-                num += 1
+            srank = script.get("RANK", 1)
+            if callable(stask) and isinstance(sname, str) and callable(sget) and isinstance(srank, (int, float)):
+                self._script[sname] = (stask, sget, srank)
                 logger.info(f"已成功加载测试脚本：{sname}")
             else:
                 logger.warning("测试脚本导入格式错误")
+
+            return True
+
+        for _pkg in packages:
+            try:
+                for entry in os.listdir(_pkg):
+                    if entry == "__init__.py":
+                        continue
+                    _name, _ext = os.path.splitext(entry)
+                    if _ext not in self.module_suffixes:
+                        continue
+                    is_loaded = unsafe_load(_name, _pkg)
+                    if is_loaded:
+                        num += 1
+            except (FileNotFoundError, NotImplementedError, OSError):
+                continue
+        self._script = dict(sorted(self._script.items(), key=lambda x: x[1][2]))
         logger.info(f"外接测试脚本成功导入数量: {num}")
 
-    @staticmethod
-    def init_callback() -> list:
-        path = os.path.join(os.getcwd(), "addons", "callback")
-        try:
-            di = os.listdir(path)
-        except FileNotFoundError:
-            di = None
-        module_name = []
+    def init_callback(self, path: Union[str, List[str]] = None) -> list:
+        if path is None:
+            path = ["addons/callback"]
         callbackfunc_list = []
-        if di is None:
-            logger.warning(f"找不到 {path} 所在的路径")
-        else:
-            for d in di:
-                if len(d) > 3:
-                    if d.endswith('.py') and d != "__init__.py":
-                        module_name.append(d[:-3])
-                    else:
-                        pass
-        for mname in module_name:
-            callbackfunc = None
+        num = 0
+
+        def unsafe_load(name: str, pkg: str) -> bool:
             try:
-                mo1 = importlib.import_module(f".{mname}", package="addons.callback")
-                callbackfunc = getattr(mo1, 'callback')
-                if callbackfunc is not None:
-                    if asyncio.iscoroutinefunction(callbackfunc):
-                        callbackfunc_list.append(callbackfunc)
-            except ModuleNotFoundError as m:
-                logger.warning(str(m))
-            except AttributeError:
-                pass
-            except NameError as n:
-                logger.warning(str(n))
-            except Exception as e:
+                m = pathlib.Path(pkg).joinpath(name).as_posix().replace('/', '.')
+                mod = importlib.import_module(m)
+            except (ModuleNotFoundError, NameError, Exception) as e:
                 logger.error(str(e))
-            if callbackfunc is None:
+                mod = None
+            if mod is None:
+                return False
+            callbackfunc = getattr(mod, 'callback', None)
+            if callbackfunc is not None and (asyncio.iscoroutinefunction(callbackfunc) or callable(callbackfunc)):
+                callbackfunc_list.append(callbackfunc)
+                return True
+            else:
+                return False
+
+        for _pkg in path:
+            try:
+                for entry in os.listdir(_pkg):
+                    if entry == "__init__.py":
+                        continue
+                    _name, _ext = os.path.splitext(entry)
+                    _name = _name.split(".")[0]
+                    if _ext not in self.module_suffixes:
+                        continue
+                    is_loaded = unsafe_load(_name, _pkg)
+                    if is_loaded:
+                        num += 1
+            except (FileNotFoundError, NotImplementedError, OSError):
                 continue
+
         logger.info(f"权限回调脚本导入数量: {len(callbackfunc_list)}")
         return callbackfunc_list
 
@@ -311,10 +310,11 @@ class AddonCleaner:
         """
         try:
             if isreload:
-                self.init_addons(self.path)
+                self.init_addons(["addons/builtin", self.path])
             from pyrogram.types import InlineKeyboardButton
             script = addon.script
             button = []
+
             for k in script.keys():
                 b = InlineKeyboardButton(f"✅{str(k)}", callback_data=f"✅{str(k)}")
                 button.append(b)
@@ -324,7 +324,7 @@ class AddonCleaner:
             return []
 
 
-def preTemplate():
+def pre_template():
     """
     内置模板。防止用户误删除项目文件导致出错，无法进行测试。
     """
@@ -333,8 +333,8 @@ allow-lan: false
 bind-address: '*'
 dns:
   default-nameserver:
-  - 119.29.29.29
-  - 223.5.5.5
+  - https://doh.pub/dns-query
+  - https://dns.alidns.com/dns-query
   enable: false
   enhanced-mode: fake-ip
   fallback:
@@ -400,13 +400,14 @@ class ClashCleaner:
         :param _config: 传入一个文件对象，或者一个字符串,文件对象需指向 yaml/yml 后缀文件
         """
         self.path = ''
-        self.unsupport_type = [] if config.getClashBranch() == 'meta' else ['wireguard', 'hysteria', 'tuic', 'vless']
+        self.unsupport_type = []
         self.yaml = {}
         self.load(_config, _config2)
         if not isinstance(self.yaml, dict):
             self.yaml = {}
 
-    def notag(self, _config: Union[bytes, str]):
+    @staticmethod
+    def notag(_config: Union[bytes, str]):
         """
         去除制表符，yaml反序列化不允许制表符出现在标量以外的地方
         """
@@ -417,7 +418,7 @@ class ClashCleaner:
             if _config == ':memory:':
                 try:
                     if _config2 is None:
-                        self.yaml = yaml.safe_load(preTemplate())
+                        self.yaml = yaml.safe_load(pre_template())
                     else:
                         try:
                             self.yaml = yaml.safe_load(_config2)
@@ -444,7 +445,7 @@ class ClashCleaner:
         """
         self.check_unsupport_proxy()
 
-    def setProxies(self, proxyinfo: list):
+    def set_proxies(self, proxyinfo: list):
         """
         覆写里面的proxies键
         :return:
@@ -722,53 +723,92 @@ class ConfigManager:
         """
         self.yaml = {}
         self.config = None
-        flag = 0
+        self._data = data
+        self._path = configpath
+        self._old_path = "./config.yaml"
         if configpath == ':memory:':
-            self.config = yaml.safe_load(preTemplate())
+            self.config = yaml.safe_load(pre_template())
             self.yaml.update(self.config)
             return
-        try:
-            with open(configpath, "r", encoding="UTF-8") as fp:
-                self.config = yaml.safe_load(fp)
-                self.yaml.update(self.config)
-        except FileNotFoundError:
-            if flag == 0 and configpath == "./resources/config.yaml":
-                flag += 1
-                logger.warning("无法在 ./resources/ 下找到 config.yaml 配置文件，正在尝试寻找旧目录 ./config.yaml")
-                try:
-                    with open('./config.yaml', "r", encoding="UTF-8") as fp1:
-                        self.config = yaml.safe_load(fp1)
-                        self.yaml.update(self.config)
-                except FileNotFoundError:
-                    self.config = {}
-                    self.yaml = {}
-            elif flag > 1:
-                logger.warning("无法找到配置文件，正在初始化...")
+        cfg_path = self.find_path()
+        with contextlib.suppress(FileNotFoundError), open(cfg_path, "r", encoding="UTF-8") as fp:
+            self.config = yaml.safe_load(fp)
+            self.yaml.update(self.config)
         if self.config is None:
             di = {'loader': "Success"}
-            with open(configpath, "w+", encoding="UTF-8") as fp:
-                yaml.dump(di, fp)
-            self.config = {}
+            with open(cfg_path, "w+", encoding="UTF-8") as fp:
+                yaml.safe_dump(di, fp)
+            self.config = di
         if data:
-            with open(configpath, "w+", encoding="UTF-8") as fp:
+            with open(cfg_path, "w+", encoding="UTF-8") as fp:
                 yaml.dump(data, fp)
             self.yaml = data
+
+    def find_path(self) -> str:
+        if os.path.exists(self._path) or self._data:
+            return self._path
+        elif os.path.exists(self._old_path):
+            return self._old_path
+        else:
+            return "./resources/config.yaml"
 
     @property
     def nospeed(self) -> bool:
         return bool(self.config.get('nospeed', False))
 
-    def speedconfig(self):
+    def speedConfig(self):
         try:
             return self.config['speedconfig']
         except KeyError:
             return {}
 
-    def speednodes(self):
+    def speednodes(self) -> int:
         try:
-            return self.config['speednodes']
+            return int(self.config['speednodes'])
+        except (KeyError, ValueError):
+            return 300
+
+    def get_slave_ranking(self, ID: Union[str, int] = None):
+        """
+        获取后端使用排行
+        """
+        userconf = self.getUserconfig()
+        usage_ranking = userconf.get('usage-ranking', {})
+        if not isinstance(usage_ranking, dict):
+            usage_ranking = {}
+        if ID is None:
+            # 返回全部用户的排行
+            return usage_ranking
+        else:
+            user_ranking = usage_ranking.get(ID, {})
+            if not isinstance(user_ranking, dict):
+                return {}
+            if not user_ranking:
+                return user_ranking
+            sorted_ranking = sorted(user_ranking.items(), key=lambda x: x[1], reverse=True)
+            sorted_ranking = {item: c for item, c in sorted_ranking}
+            return sorted_ranking
+
+    def get_ua(self):
+        """
+        获取自定义ua
+        """
+        try:
+            return {"user-agent": str(self.config['ua'])}
         except KeyError:
-            return int(300)
+            return ""
+
+    def getConcurrency(self) -> int:
+        clashconf = self.config.get('clash', {})
+        max_workers = min(32, (os.cpu_count() or 1) + 14)
+        if isinstance(clashconf, dict):
+            num = clashconf.get('core', max_workers)
+            if isinstance(num, int):
+                return num
+            else:
+                return max_workers
+        else:
+            return max_workers
 
     def getClashBranch(self):
         """
@@ -790,10 +830,12 @@ class ConfigManager:
         return self.config.get('masterconfig', {})
 
     def getUserconfig(self):
-        userconfig = self.config.get('userconfig', {})
-        if not isinstance(userconfig, dict):
-            logger.warning("userconfig的类型应为字典")
-            return {}
+        try:
+            userconfig = self.config['userconfig']
+        except KeyError:
+            logger.info("未存在userconfig，初始化userconfig配置")
+            config.yaml['userconfig'] = {}
+            userconfig = {}
         return userconfig
 
     def getSlavecomment(self, slaveid: str) -> str:
@@ -826,7 +868,7 @@ class ConfigManager:
     def getBotconfig(self):
         botconfig = self.config.get('bot', {})
         if botconfig is None:
-            print("bot_config为None")
+            logger.warning("bot配置项为None")
             return {}
         if not botconfig:
             return botconfig
@@ -888,7 +930,7 @@ class ConfigManager:
         """
         try:
             if isjoint:
-                return 'http://' + self.config.get('bot', {}).get('proxy', None)
+                return 'http://' + str(self.config.get('bot', {}).get('proxy', None))
             else:
                 return self.config.get('bot', {}).get('proxy', None)
         except KeyError:
@@ -943,22 +985,7 @@ class ConfigManager:
         try:
             return self.config['clash']['path']
         except KeyError:
-            logger.warning("获取运行路径失败，将采用默认运行路径: ./bin\n自动识别windows,linux,macos系统。架构默认为amd64")
-            if sys.platform.startswith("linux"):
-                path = './bin/fulltclash-linux-amd64'
-            elif sys.platform.startswith("win32"):
-                path = r'.\bin\fulltclash-windows-amd64.exe'
-            elif 'darwin' in sys.platform:
-                path = './bin/fulltclash-macos-amd64'
-            else:
-                path = './bin/fulltclash-linux-amd64'
-            d = {'path': path}
-            try:
-                self.yaml['clash'].update(d)
-            except KeyError:
-                di = {'clash': d}
-                self.yaml.update(di)
-            return path
+            return None
 
     def get_sub(self, subname: str = None):
         """
@@ -977,14 +1004,6 @@ class ConfigManager:
             except KeyError:
                 return {}
 
-    @logger.catch
-    def add(self, data: dict, key):
-        try:
-            self.yaml[key] = data[key]
-        except Exception as e:
-            print(e)
-
-    @logger.catch
     def add_admin(self, admin: Union[list, str, int]):
         """
         添加管理员
@@ -1001,13 +1020,10 @@ class ConfigManager:
                 adminlist.extend(old)
                 newadminlist = list(set(adminlist))  # 去重
                 self.yaml['admin'] = newadminlist
-                logger.info("添加成功")
         except KeyError:
             newadminlist = list(set(adminlist))  # 去重
             self.yaml['admin'] = newadminlist
-            logger.info("添加成功")
 
-    @logger.catch
     def del_admin(self, admin: list or str or int):
         """
         删除管理员
@@ -1048,12 +1064,12 @@ class ConfigManager:
         if not self.reload():
             logger.error("重载失败")
 
-    def add_user(self, user: list or str or int):
+    def add_user(self, user: Union[list, str, int]):
         """
         添加授权用户
         """
         userlist = []
-        if type(user).__name__ == "list":
+        if isinstance(user, list):
             for li in user:
                 userlist.append(li)
         else:
@@ -1064,11 +1080,9 @@ class ConfigManager:
                 userlist.extend(old)
             newuserlist = list(set(userlist))  # 去重
             self.yaml['user'] = newuserlist
-            logger.info("添加成功")
         except KeyError:
             newuserlist = list(set(userlist))  # 去重
             self.yaml['user'] = newuserlist
-            logger.info("添加成功")
 
     @logger.catch
     def del_user(self, user: list or str or int):
@@ -1222,42 +1236,6 @@ class ReCleaner:
                     task = self.script[i][1]
                     info[i] = task(self)
                     continue
-                if i == "Youtube":
-                    from addons.builtin import youtube
-                    you = youtube.get_youtube_info(self)
-                    info['Youtube'] = you
-                elif i == "Disney":
-                    dis = self.getDisneyinfo()
-                    info['Disney'] = dis
-                elif i == "Disney+":
-                    dis = self.getDisneyinfo()
-                    info['Disney+'] = dis
-                elif i == "Dazn":
-                    dazn = self.get_dazn_info()
-                    info['Dazn'] = dazn
-                elif i == "Netflix":
-                    from addons.builtin import netflix
-                    info['Netflix'] = netflix.get_netflix_info_new(self)
-                elif i == "TVB":
-                    from addons.builtin import tvb
-                    info['TVB'] = tvb.get_TVBAnywhere_info(self)
-                elif i == "Viu":
-                    from addons.builtin import viu
-                    info['Viu'] = viu.get_viu_info(self)
-                elif i == "iprisk" or i == "落地IP风险":
-                    from addons.builtin import ip_risk
-                    info['落地IP风险'] = ip_risk.get_iprisk_info(self)
-                elif i == "steam货币":
-                    from addons.builtin import steam
-                    info['steam货币'] = steam.get_steam_info(self)
-                elif i == "维基百科":
-                    from addons.builtin import wikipedia
-                    info['维基百科'] = wikipedia.get_wikipedia_info(self)
-                elif item == "OpenAI":
-                    from addons.builtin import openai
-                    info['OpenAI'] = openai.get_openai_info(self)
-                else:
-                    pass
         except Exception as e:
             logger.error(str(e))
         return info
@@ -1398,14 +1376,17 @@ class ResultCleaner:
     def convert_proxy_typename(self):
         if '类型' in self.data:
             new_type = []
-            type1 = self.data['类型']
+            type1: List[str] = self.data['类型']
             if not isinstance(type1, list):
                 return
             for t in type1:
-                if t == 'ss':
+                tt = t.lower()
+                if tt == 'ss':
                     new_type.append("Shadowsocks")
-                elif t == "ssr":
+                elif tt == "ssr":
                     new_type.append("ShadowsocksR")
+                elif tt == 'tuic':
+                    new_type.append("TUIC")
                 else:
                     new_type.append(t.capitalize())
             self.data['类型'] = new_type
@@ -1424,6 +1405,17 @@ class ResultCleaner:
         elif sort_str == '最大速度降序':
             self.sort_by_item("最大速度", reverse=True)
 
+    @staticmethod
+    def format_size(size: Union[int, float]):
+        import math
+        SIZE_UNIT = ["B", "KB", "MB", "GB", "TB", "PB"]
+        if size < 1:
+            return "0KB"
+        i = int(math.floor(math.log(size, 1024)))
+        power = math.pow(1024, i)
+        size = round(size / power, 2)
+        return f"{size}{SIZE_UNIT[i]}"
+
     def padding(self):
         """
         填充字符
@@ -1432,37 +1424,54 @@ class ResultCleaner:
             rtt = self.data['HTTP(S)延迟']
             new_rtt = []
             for r in rtt:
-                new_rtt.append(str(r) + 'ms')
+                n_r = str(r).lower()
+                n_r = n_r if n_r.endswith("ms") else n_r + "ms"
+                new_rtt.append(n_r)
             self.data['HTTP(S)延迟'] = new_rtt
 
         if '平均速度' in self.data:
             new_list = []
             for a in self.data['平均速度']:
-                avgspeed_mb = a / 1024 / 1024
-                if avgspeed_mb < 1:
-                    avgspeed = a / 1024
-                    new_list.append(f"{avgspeed:.2f}KB")
-                else:
-                    new_list.append(f"{avgspeed_mb:.2f}MB")
+                avgspeed = self.format_size(a)
+                new_list.append(avgspeed)
+                # avgspeed_mb = float(a) / 1024 / 1024
+                # if avgspeed_mb < 1:
+                #     avgspeed = a / 1024
+                #     new_list.append(f"{avgspeed:.2f}KB")
+                # else:
+                #     new_list.append(f"{avgspeed_mb:.2f}MB")
             self.data['平均速度'] = new_list
         if '最大速度' in self.data:
             new_list = []
             for a in self.data['最大速度']:
-                maxspeed_mb = a / 1024 / 1024
-                if maxspeed_mb < 1:
-                    maxspeed = a / 1024
-                    new_list.append(f"{maxspeed:.2f}KB")
-                else:
-                    new_list.append(f"{maxspeed_mb:.2f}MB")
+                maxspeed = self.format_size(a)
+                new_list.append(maxspeed)
+                # maxspeed_mb = a / 1024 / 1024
+                # if maxspeed_mb < 1:
+                #     maxspeed = a / 1024
+                #     new_list.append(f"{maxspeed:.2f}KB")
+                # else:
+                #     new_list.append(f"{maxspeed_mb:.2f}MB")
             self.data['最大速度'] = new_list
         if '每秒速度' in self.data:
             self.data['每秒速度'] = [[j / 1024 / 1024 for j in i] for i in self.data['每秒速度']]
+
+    def calc_used(self):
+        if '每秒速度' in self.data and '消耗流量' not in self.data:
+            traffic_used = 0
+            for node_res in self.data['每秒速度']:
+                if isinstance(node_res, list):
+                    traffic_used += sum(node_res)
+                elif isinstance(node_res, (float, int)):
+                    traffic_used += node_res
+            self.data['消耗流量'] = traffic_used
 
     def start(self, sort="订阅原序"):
         try:
             self.convert_proxy_typename()
             self.sort(sort)
             self.padding()
+            self.calc_used()
             return self.data
         except TypeError as t:
             logger.error(str(t))
@@ -1474,11 +1483,12 @@ class ResultCleaner:
         """
         if item not in self.data:
             return
-        item_list = self.data.get(item, [])
+        raw_item_list = self.data.get(item, [])
+        item_list = deepcopy(raw_item_list)
         if item == "HTTP(S)延迟" and not reverse:
             for i in range(len(item_list)):
                 if item_list[i] == 0:
-                    item_list[i] = 9999999
+                    item_list[i] = 999999
         temp_1 = [k for k, v in self.data.items()
                   if not isinstance(v, (list, tuple)) or len(v) != len(item_list)]
         temp_dict = {}
@@ -1500,7 +1510,7 @@ class ResultCleaner:
         if not reverse:
             for i in range(len(http_l)):
                 if http_l[i] == 0:
-                    http_l[i] = 9999999
+                    http_l[i] = 999999
         temp_1 = [k for k, v in self.data.items()
                   if not isinstance(v, (list, tuple)) or len(v) != len(http_l)]
         temp_dict = {}
@@ -1610,8 +1620,8 @@ def protocol_join(protocol_link: str):
                        "config%2FACL4SSR_Online.ini"
     else:
         remoteconfig = quote(remoteconfig)
-
-    new_link = f"https://{subcvtaddr}/sub?target=clash&new_name=true&url=" + quote(protocol_link) + \
+    scheme = "https" if bool(subcvtconf.get('tls', True)) else "http"
+    new_link = f"{scheme}://{subcvtaddr}/sub?target=clash&new_name=true&url=" + quote(protocol_link) + \
                f"&insert=false&config={remoteconfig}"
     return new_link
 
@@ -1623,8 +1633,7 @@ def geturl(string: str, protocol_match: bool = False):
     :param: protocol_match: 是否匹配协议URI，并拼接成ubconverter形式
     """
     text = string
-    pattern = re.compile(
-        r"https?://(?:[a-zA-Z]|\d|[$-_@.&+]|[!*,]|[\w\u4e00-\u9fa5])+")  # 匹配订阅地址
+    pattern = re.compile("https?://(?:[a-zA-Z]|\d|[$-_@.&+]|[!*,]|[\w\u4e00-\u9fa5])+")  # 匹配订阅地址
     # 获取订阅地址
     try:
         url = pattern.findall(text)[0]  # 列表中第一个项为订阅地址
@@ -1653,6 +1662,23 @@ def domain_to_ip(host: str):
             ips.add(result[4][0])
         ip = list(ips)
         return ip
+    except socket.gaierror:
+        return None
+
+
+async def async_domain_to_ip(host: str):
+    loop = asyncio.get_running_loop()
+    try:
+        results = await loop.getaddrinfo(
+            host,
+            None,
+            family=socket.AF_UNSPEC,
+            type=socket.SOCK_STREAM,
+        )
+        ips = set()
+        for result in results:
+            ips.add(result[4][0])
+        return list(ips)
     except socket.gaierror:
         return None
 
@@ -1772,3 +1798,41 @@ def batch_ipcu(host: list):
             else:
                 ipcu.append("N/A")
     return ipcu
+
+
+def unzip_targz(input_file: Union[str, Path], output_path: Union[str, Path]) -> List[str]:
+    """解压 tar.gz 文件, 返回解压后的文件名称列表"""
+    unzip_files = []
+    try:
+        temp_path = str(input_file).removesuffix(".gz")
+        path = Path(input_file)
+        path2 = Path(output_path)
+        with gzip.open(path, 'rb') as f_in, open(temp_path, 'wb') as f_out:
+            f_out.write(f_in.read())
+
+        with tarfile.open(temp_path) as tar:
+            for member in tar.getmembers():
+                member_path = path2.joinpath(member.name)
+                logger.info("正在解压: " + str(member_path))
+                f = tar.extractfile(member)
+                with open(member_path, 'wb') as ff:
+                    ff.write(f.read())
+                f.close()
+                unzip_files.append(str(member_path))
+        archive_file = Path(temp_path).absolute()
+        archive_file.unlink()
+
+    except Exception as e:
+        logger.error(str(e))
+    finally:
+        return unzip_files
+
+
+def unzip(input_file: Union[str, Path], output_path: Union[str, Path]):
+    """解压zip文件"""
+    try:
+        output_path = Path(output_path) if isinstance(output_path, Path) else output_path
+        shutil.unpack_archive(str(input_file), output_path, format='zip')
+        return True
+    except shutil.Error:
+        return False

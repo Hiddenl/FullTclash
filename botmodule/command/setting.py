@@ -15,6 +15,7 @@ from utils.myqueue import bot_put
 from utils.check import get_telegram_id_from_message as getID
 from utils import message_delete_queue as mdq
 from glovar import __version__
+from botmodule.record import get_slave_ranking
 from botmodule.rule import get_rule, new_rule
 from botmodule.init_bot import latest_version_hash as v_hash, config
 from botmodule.command.authority import (Invite, INVITE_SELECT_CACHE as ISC,
@@ -22,7 +23,7 @@ from botmodule.command.authority import (Invite, INVITE_SELECT_CACHE as ISC,
 
 dsc = default_slave_comment = config.getSlaveconfig().get('default-slave', {}).get('comment', "本地后端")
 dsi = default_slave_id = config.getSlaveconfig().get('default-slave', {}).get('username', "local")
-ds_shadow = bool(config.getSlaveconfig().get('default-slave', {}).get('shadow', False))  # 是否隐藏默认后端
+ds_shadow = bool(config.getSlaveconfig().get('default-slave', {}).get('hidden', False))  # 是否隐藏默认后端
 dbtn = default_button = {
     1: IKB("✅Netflix", callback_data='✅Netflix'),
     2: IKB("✅Youtube", callback_data='✅Youtube'),
@@ -41,7 +42,7 @@ dbtn = default_button = {
     'b_okpage': IKB("🔒完成本页选择", callback_data="ok_p"),
     'b_all': IKB("全测", callback_data="全测"),
     'b_origin': IKB("♾️订阅原序", callback_data="sort:订阅原序"),
-    'b_rhttp': IKB("⬇️HTTP倒序", callback_data="sort:HTTP倒序"),
+    'b_rhttp': IKB("⬇️HTTP降序", callback_data="sort:HTTP降序"),
     'b_http': IKB("⬆️HTTP升序", callback_data="sort:HTTP升序"),
     'b_aspeed': IKB("⬆️平均速度升序", callback_data="sort:平均速度升序"),
     'b_arspeed': IKB("⬇️平均速度降序", callback_data="sort:平均速度降序"),
@@ -56,7 +57,8 @@ dbtn = default_button = {
     8: IKB("👌完成选择", "/api/script/ok")
 }
 
-buttons = [dbtn[1], dbtn[2], dbtn[3], dbtn[25], dbtn[15], dbtn[18], dbtn[20], dbtn[21], dbtn[19]]
+# buttons = [dbtn[1], dbtn[2], dbtn[3], dbtn[25], dbtn[15], dbtn[18], dbtn[20], dbtn[21], dbtn[19]]
+buttons = []
 buttons.extend(addon.init_button(isreload=True))
 max_page_g = int(len(buttons) / 9) + 1
 blank_g = IKB(f"{1}/{max_page_g}", callback_data="blank")
@@ -85,7 +87,8 @@ receiver: Dict[str, asyncio.Queue] = {}  # 临时数据接收器
 
 def reload_button():
     global buttons
-    buttons = [dbtn[1], dbtn[2], dbtn[3], dbtn[25], dbtn[15], dbtn[18], dbtn[20], dbtn[21], dbtn[19]]
+    buttons = []
+    # buttons = [dbtn[1], dbtn[2], dbtn[3], dbtn[25], dbtn[15], dbtn[18], dbtn[20], dbtn[21], dbtn[19]]
     buttons.extend(addon.init_button())
 
 
@@ -155,14 +158,13 @@ async def test_setting(client: Client, callback_query: CallbackQuery, row=3, **k
     mess_id = callback_query.message.id
     chat_id = callback_query.message.chat.id
     origin_message = callback_query.message.reply_to_message
-    if origin_message is None:
-        logger.warning("⚠️无法获取发起该任务的源消息")
-        # await edit_mess.edit_text("⚠️无法获取发起该任务的源消息")
-        return test_items, origin_message, message, ''
     inline_keyboard = callback_query.message.reply_markup.inline_keyboard
 
+    if origin_message is None:
+        return test_items, origin_message, message, ''
     with contextlib.suppress(IndexError, ValueError):
-        test_type = origin_message.text.split(" ", maxsplit=1)[0].split("@", maxsplit=1)[0]
+        test_type = origin_message.text.split(" ", maxsplit=1)[0].split("@", maxsplit=1)[0] \
+            if origin_message is not None else ''
 
     try:
         if "✅" == callback_data[0]:
@@ -198,7 +200,7 @@ async def test_setting(client: Client, callback_query: CallbackQuery, row=3, **k
                         q = receiver[bot_key]
                         try:
                             if isinstance(q, asyncio.Queue):
-                                q.put_nowait(test_items)
+                                q.put_nowait("*")
                             else:
                                 await edit_mess.reply("运行发现逻辑错误，请联系管理员~")
                         except asyncio.queues.QueueFull:
@@ -412,18 +414,33 @@ def page_frame(pageprefix: str, contentprefix: str, content: List[str], split: s
     return content_keyboard
 
 
+def get_ranked_slave_list(slaveconf: dict, sorted_ranking: dict):
+    new_dict = {}
+    slaveconf_copy = deepcopy(slaveconf)
+    for k, _ in sorted_ranking.items():
+        if k in slaveconf_copy:
+            new_dict[k] = slaveconf_copy.pop(k)
+    new_dict.update(slaveconf_copy)
+    return new_dict
+
+
 async def select_slave_page(_: Client, call: Union[CallbackQuery, Message], content_prefix: str = "slave:", **kwargs):
     """
     选择后端页面的入口
     content_prefix: 后端的回调按钮数据的前缀，默认为slave:
     """
-    slaveconfig = config.getSlaveconfig()
+    slaveconfig = config.getSlaveconfig().copy()
+    if "default-slave" in slaveconfig:
+        slaveconfig.pop("default-slave")
+    usermsg = call.message.reply_to_message if isinstance(call, CallbackQuery) else call
+    uconf = config.getUserconfig()
+    if "usage-ranking" in uconf and bool(uconf.get("usage-ranking", {}).get("enable", True)):
+        user_ranking = get_slave_ranking(getID(usermsg))
+        slaveconfig = get_ranked_slave_list(slaveconfig, user_ranking)
+    comment = [i.get('comment', None) for k, i in slaveconfig.items() if i.get('comment', None)]
 
-    comment = [i.get('comment', None) for k, i in slaveconfig.items() if
-               i.get('comment', None) and k != "default-slave"]
-
-    page = kwargs.get('page', 1)
-    row = kwargs.get('row', 5)
+    page = int(kwargs.get('page', 1))
+    row = int(kwargs.get('row', 5))
     max_page = int(len(comment) / row) + 1
     pre_page_text = page - 1 if page - 1 > 0 else 1
     next_page_text = page + 1 if page < max_page else max_page
@@ -482,7 +499,11 @@ async def task_handler(app: Client, message: Message, **kwargs):
 async def select_task(app: Client, originmsg: Message, slaveid: str, sort: str, script: list = None):
     if originmsg.text.startswith('/invite'):
         comment = config.getSlavecomment(slaveid)
-        scripttext = ",".join(script) if script is not None else ""
+        if script is not None:
+            tmp_script = deepcopy(script)[::-1]
+            scripttext = ",".join(tmp_script[:10]) + f"...共{len(script)}个脚本" if len(script) > 10 else ",".join(script)
+        else:
+            scripttext = ''
         invite_help_text = f"🤖选中后端: {comment}\n⛓️选中排序: {sort}\n🧵选中脚本: {scripttext}\n\n"
         botmsg = await originmsg.reply(invite_help_text)
         key = genkey(8)
@@ -509,10 +530,14 @@ async def select_slave_only_1(_: Client, call: Union[CallbackQuery, Message], **
     """
     page_prefix = '/api/slave/page/'
     api_route = '/api/getSlaveId'
-    page = 1 if isinstance(call, Message) else call.data[len(page_prefix):]
-    slaveconfig = config.getSlaveconfig()
-    comment = [i.get('comment', None) for k, i in slaveconfig.items() if
-               i.get('comment', None) and k != "default-slave"]
+    page = 1 if isinstance(call, Message) else int(call.data[len(page_prefix):])
+    slaveconfig = config.getSlaveconfig().copy()
+    if "default-slave" in slaveconfig:
+        slaveconfig.pop("default-slave")
+    usermsg = call.message.reply_to_message if isinstance(call, CallbackQuery) else call
+    user_ranking = get_slave_ranking(getID(usermsg))
+    slaveconfig = get_ranked_slave_list(slaveconfig, user_ranking)
+    comment = [i.get('comment', None) for k, i in slaveconfig.items() if i.get('comment', None)]
     content_keyboard = page_frame(page_prefix, api_route, comment, split='?comment=', page=page, **kwargs)
     if page == 1:
         if not ds_shadow:
@@ -525,7 +550,62 @@ async def select_slave_only_1(_: Client, call: Union[CallbackQuery, Message], **
     if isinstance(call, CallbackQuery):
         await target.edit_text(target.text, reply_markup=IKM)
     else:
-        return await target.reply(f"请选择测试后端:\n", quote=True, reply_markup=IKM)
+        return await target.reply("请选择测试后端:\n", quote=True, reply_markup=IKM)
+
+
+async def select_slave_only(app: Client, call: Union[CallbackQuery, Message], timeout=60, **kwargs) -> tuple[str, str]:
+    """
+    高层级的选择后端api
+
+    return: (slaveid, comment)
+    """
+    if isinstance(call, Message):
+        botmsg = await select_slave_only_1(app, call, timeout=timeout, **kwargs)
+
+        recvkey = gen_msg_key(botmsg)
+        q = asyncio.Queue(1)
+        receiver[recvkey] = q
+
+        try:
+            async with async_timeout.timeout(timeout):
+                comment = await q.get()
+                slaveconfig = config.getSlaveconfig()
+                slaveid = ''
+
+                for k, v in slaveconfig.items():
+                    if v.get('comment', '') == comment:
+                        if str(k) == "default-slave":
+                            slaveid = 'local'
+                            break
+                        slaveid = str(k)
+                        break
+                if not slaveid and comment == "本地后端":
+                    slaveid = "local"
+                if slaveid and comment:
+                    return str(slaveid), comment
+                else:
+                    await botmsg.delete()
+                    return '', ''
+
+        except asyncio.exceptions.TimeoutError:
+            print("获取超时")
+            return '', ''
+        finally:
+            receiver.pop(recvkey, None)
+            await botmsg.delete(revoke=True)
+    else:
+        api_route = '/api/getSlaveId'
+        le = len(api_route) + len("?comment=")
+        key = gen_msg_key(call.message)
+        if key in receiver:
+            q = receiver[key]
+            try:
+                if isinstance(q, asyncio.Queue):
+                    q.put_nowait(str(call.data)[le:])
+            except asyncio.queues.QueueFull:
+                pass
+        else:
+            await call.answer("❌无法找到该消息与之对应的队列")
 
 
 async def select_script_only(_: "Client", call: Union["CallbackQuery", "Message"],
@@ -538,14 +618,17 @@ async def select_script_only(_: "Client", call: Union["CallbackQuery", "Message"
     """
     api_route = "/api/script/ok"
     if isinstance(call, Message):
+        if len(buttons) < 8:
+            await call.reply(f"发生错误: buttons < 8")
+            return
         IKM = InlineKeyboardMarkup(
             [
                 # 第一行
                 [dbtn['b_okpage']],
-                [dbtn[1], dbtn[2], dbtn[3]],
+                buttons[:3],
                 # 第二行
-                [dbtn[20], dbtn[25], dbtn[18]],
-                [dbtn[15], dbtn[21], dbtn[19]],
+                buttons[3:6],
+                buttons[6:9],
                 [dbtn['b_all'], blank_g, next_page_g],
                 [dbtn['b_cancel'], dbtn['b_reverse']],
                 [IKB("👌完成选择", api_route)]
@@ -561,6 +644,13 @@ async def select_script_only(_: "Client", call: Union["CallbackQuery", "Message"
                 script_list = await q.get()
                 if isinstance(script_list, list):
                     return script_list
+                elif isinstance(script_list, str):
+                    if script_list == "全测" or script_list == "all" or script_list == "*":
+                        script = addon.global_test_item(True)
+                    else:
+                        new_script = [s for s in addon.global_test_item(True) if script_list in s]
+                        script = new_script
+                    return script
                 else:
                     await botmsg.reply("❌数据类型接收错误")
                     return None
@@ -666,61 +756,6 @@ async def select_sort_only(_: "Client", call: Union["CallbackQuery", "Message"],
             await call.answer("❌无法找到该消息与之对应的队列")
 
 
-async def select_slave_only(app: Client, call: Union[CallbackQuery, Message], timeout=60, **kwargs) -> tuple[str, str]:
-    """
-    高层级的选择后端api
-
-    return: (slaveid, comment)
-    """
-    if isinstance(call, Message):
-        botmsg = await select_slave_only_1(app, call, timeout=timeout, **kwargs)
-
-        recvkey = gen_msg_key(botmsg)
-        q = asyncio.Queue(1)
-        receiver[recvkey] = q
-
-        try:
-            async with async_timeout.timeout(timeout):
-                comment = await q.get()
-                slaveconfig = config.getSlaveconfig()
-                slaveid = ''
-
-                for k, v in slaveconfig.items():
-                    if v.get('comment', '') == comment:
-                        if str(k) == "default-slave":
-                            slaveid = 'local'
-                            break
-                        slaveid = str(k)
-                        break
-                if not slaveid and comment == "本地后端":
-                    slaveid = "local"
-                if slaveid and comment:
-                    return str(slaveid), comment
-                else:
-                    await botmsg.delete()
-                    return '', ''
-
-        except asyncio.exceptions.TimeoutError:
-            print("获取超时")
-            return '', ''
-        finally:
-            receiver.pop(recvkey, None)
-            await botmsg.delete(revoke=True)
-    else:
-        api_route = '/api/getSlaveId'
-        le = len(api_route) + len("?comment=")
-        key = gen_msg_key(call.message)
-        if key in receiver:
-            q = receiver[key]
-            try:
-                if isinstance(q, asyncio.Queue):
-                    q.put_nowait(str(call.data)[le:])
-            except asyncio.queues.QueueFull:
-                pass
-        else:
-            await call.answer("❌无法找到该消息与之对应的队列")
-
-
 async def select_slave(app: Client, call: CallbackQuery):
     """
     内置的旧版选择后端回调查询
@@ -776,14 +811,17 @@ async def select_sort(app: Client, call: CallbackQuery):
         BOT_MESSAGE_CACHE[key] = call.message
         await Invite(key=key).invite(app, originmsg)
         return
+    if len(buttons) < 8:
+        await call.message.edit_text(f"发生错误: buttons < 8")
+        return
     IKM = InlineKeyboardMarkup(
         [
             # 第一行
             [dbtn['b_okpage']],
-            [dbtn[1], dbtn[2], dbtn[3]],
+            [*buttons[:3]],
             # 第二行
-            [dbtn[20], dbtn[25], dbtn[18]],
-            [dbtn[15], dbtn[21], dbtn[19]],
+            [*buttons[3:6]],
+            [*buttons[6:9]],
             [dbtn['b_all'], blank_g, next_page_g],
             [dbtn['yusanjia'], dbtn['b_alive']],
             [dbtn['b_cancel'], dbtn['b_reverse']],
@@ -798,7 +836,7 @@ async def select_sort(app: Client, call: CallbackQuery):
 
 
 async def home_setting(_: Client, call: Union[Message, CallbackQuery]):
-    text = config.config.get('bot', {}).get('description', f"🛠️FullTclash bot管理总枢🛠️\n\n版本: {__version__}({v_hash})")
+    text = config.config.get('bot', {}).get('description', f"🛠️FullTClash bot管理总枢🛠️\n\n版本: {__version__}({v_hash})")
     addon_button = IKB("🧩插件管理(开发中)", callback_data="blank")
     config_button = IKB("⚙️配置管理", callback_data="/api/config/home")
     sub_button = IKB("🌐订阅管理(开发中)", callback_data="blank")

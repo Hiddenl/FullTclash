@@ -1,16 +1,25 @@
 import asyncio
+import contextlib
+import re
 import ssl
+import sys
 import time
-from typing import List
+from datetime import datetime
+from pathlib import Path
+
+from typing import List, Union
+from urllib.parse import quote, urlparse
 
 import aiohttp
 import async_timeout
-from urllib.parse import quote
+from aiohttp import ClientSession
+
 from aiohttp.client_exceptions import ClientConnectorError, ContentTypeError
 from aiohttp_socks import ProxyConnector, ProxyConnectionError
 from loguru import logger
 
 from utils import cleaner
+from utils.cleaner import config
 
 """
 这是整个项目最为核心的功能模块之一 —> 采集器。它负责从网络上采集想要的数据。到现在，已经设计了：
@@ -25,7 +34,6 @@ from utils import cleaner
 如果你想自己添加一个流媒体测试项，建议查看 ./resources/dos/新增流媒体测试项指南.md
 """
 
-config = cleaner.ConfigManager()
 addon = cleaner.addon
 media_items = config.get_media_item()
 proxies = config.get_proxy()  # 代理
@@ -33,7 +41,7 @@ netflix_url = config.config.get('netflixurl', "https://www.netflix.com/title/701
 
 
 def reload_config(media: list = None):
-    global config, proxies, media_items
+    global proxies, media_items
     config.reload(issave=False)
     proxies = config.get_proxy()
     media_items = config.get_media_item()
@@ -54,10 +62,92 @@ class BaseCollector:
                     return response.status
 
     async def fetch(self, url, proxy=None):
-        with async_timeout.timeout(10):
+        async with async_timeout.timeout(10):
             async with aiohttp.ClientSession(headers=self._headers) as session:
                 async with session.get(url, proxy=proxy) as response:
                     return await response.content.read()
+
+
+class DownloadError(aiohttp.ClientError):
+    """下载出错抛出的异常"""
+
+
+class Download(BaseCollector):
+    def __init__(self, url: str = None, savepath: Union[str, Path] = None, savename: str = None):
+        _formatted_now = f'{datetime.now():%Y-%m-%dT%H-%M-%S}'
+        self.url = url
+        self.savepath = savepath
+        self.savename = savename if savename is not None else f"download-{_formatted_now}"
+        self._start_time = 0
+        self._current_time = 0
+        self._pause = 0.01
+        super().__init__()
+
+    async def download_common(self, url: str = None, savepath: Union[str, Path] = None, **kwargs) -> bool:
+        """
+        通用下载函数
+        """
+        url = url or self.url
+        savepath = savepath or self.savepath or "."
+        savepath = str(savepath)
+        savepath = savepath if savepath.endswith("/") else savepath + "/"
+        savename = self.savename.lstrip("/")
+        write_path = savepath + savename
+        from utils.cleaner import geturl
+        url = geturl(url)
+        if not url:
+            raise DownloadError(f"这不是有效的URL: {url}")
+        print(f"Download URL: {url}")
+        try:
+            from async_timeout import timeout
+            async with ClientSession(headers=self._headers) as session, session.get(url, **kwargs) as resp:
+                # async with session.get(url, **kwargs) as resp:
+                if 300 > resp.status >= 200:
+                    content_leagth = resp.content_length if resp.content_length else 10 * 1024 * 1024
+                    length = 0
+                    self._start_time = time.time()
+                    self._current_time = self._start_time
+                    if sys.platform.startswith("win"):
+                        self._pause = 0.03
+                    with open(write_path, 'wb') as f, contextlib.suppress(StopIteration):
+                        while True:
+                            async with timeout(20):
+                                chunk = await resp.content.read(1024)
+                            length += len(chunk)
+                            # 计算进度条长度
+                            percent = int(length * 100 / content_leagth)
+                            p_text = '=' * int(length * 100 / content_leagth)
+                            spaces = ' ' * (100 - percent)
+                            _current_time = time.time()
+                            _time_used = round(_current_time - self._start_time, 2)
+                            if _current_time - self._current_time > self._pause:
+                                print(f"\r[{p_text}>{spaces}]{percent}% {length} B 已用时间={_time_used}s", end="")
+                            self._current_time = _current_time
+                            if not chunk:
+                                break
+
+                            f.write(chunk)
+                        l2 = float(length) / 1024 / 1024
+                        l2 = round(l2, 2)
+                        spath = str(Path(savepath).absolute())
+                        per_second_speed = round(l2 / (self._current_time - self._start_time), 2)
+                        print(f"\r[{p_text}>{spaces}]{percent}% {length} B({l2}MB) {' ' * 10}"
+                              f"\n已用时间={_time_used}s 速度={per_second_speed}MB/s 保存路径={spath}")
+                elif resp.status == 404:
+                    raise DownloadError(f"Resources not found: {resp.status}==>\t{url}")
+                else:
+                    raise DownloadError("Error Status:" + str(resp.status))
+            return True
+        except (aiohttp.ClientError, OSError) as e:
+            raise DownloadError("Download failed") from e
+        except asyncio.exceptions.TimeoutError as e:
+            raise DownloadError(f"Download timeout: {url}") from e
+
+    async def dowload(self, url: str = None, savepath: Union[str, Path] = None, **kwargs) -> bool:
+        """
+        执行下载操作
+        """
+        return await self.download_common(url, savepath, **kwargs)
 
 
 class IPCollector:
@@ -202,22 +292,22 @@ class SubCollector(BaseCollector):
         """
         super().__init__()
         self.text = None
-        self._headers = {'User-Agent': 'clash'}  # 这个请求头是获取流量信息的关键
-        self.subconverter = config.config.get('subconverter', {})
-        self.cvt_enable = self.subconverter.get('enable', False)
+        self._headers = {'user-agent': 'ClashMetaForAndroid/2.8.9.Meta Mihomo/0.16 Clash.Meta'}  # 这个请求头是获取流量信息的关键
+        self.subcvt_conf = config.config.get('subconverter', {})
+        self.cvt_enable = self.subcvt_conf.get('enable', False)
         self.url = suburl
         self.include = include
         self.exclude = exclude
         self.codeurl = quote(suburl, encoding='utf-8')
         self.code_include = quote(include, encoding='utf-8')
         self.code_exclude = quote(exclude, encoding='utf-8')
-        self.cvt_host = str(self.subconverter.get('host', '127.0.0.1:25500'))
+        self.cvt_host = str(self.subcvt_conf.get('host', '127.0.0.1:25500'))
         self.cvt_scheme = self.parse_cvt_scheme()
         self.cvt_url = f"{self.cvt_scheme}://{self.cvt_host}/sub?target=clash&new_name=true&url={self.codeurl}" \
                        + f"&include={self.code_include}&exclude={self.code_exclude}"
-        self.sub_remote_config = self.subconverter.get('remoteconfig', '')
-        self.config_include = quote(self.subconverter.get('include', ''), encoding='utf-8')  # 这两个
-        self.config_exclude = quote(self.subconverter.get('exclude', ''), encoding='utf-8')
+        self.sub_remote_config = self.subcvt_conf.get('remoteconfig', '')
+        self.config_include = quote(self.subcvt_conf.get('include', ''), encoding='utf-8')  # 这两个
+        self.config_exclude = quote(self.subcvt_conf.get('exclude', ''), encoding='utf-8')
         # print(f"配置文件过滤,包含：{self.config_include} 排除：{self.config_exclude}")
         if self.config_include or self.config_exclude:
             self.cvt_url = f"{self.cvt_scheme}://{self.cvt_host}/sub?target=clash&new_name=true&url={self.cvt_url}" \
@@ -230,13 +320,10 @@ class SubCollector(BaseCollector):
                 self.cvt_url = self.url
 
     def parse_cvt_scheme(self) -> str:
-        temp_cvt = self.cvt_host.split(":")
-        cvt_scheme = 'http'
-        if len(temp_cvt) == 2:
-            hostname = temp_cvt[0]
-            if hostname != "127.0.0.1":
-                cvt_scheme = 'https'
-        return cvt_scheme
+        if not bool(self.subcvt_conf.get('tls', False)):
+            return "http"
+        else:
+            return "https"
 
     async def start(self, proxy=None):
         try:
@@ -248,13 +335,55 @@ class SubCollector(BaseCollector):
             logger.error(e)
             return None
 
+    async def getSiteTitle(self, proxy=proxies):
+        _headers = config.get_ua() or {'user-agent': 'ClashMetaForAndroid/2.8.9.Meta Mihomo/0.16 Clash.Meta'}
+
+        async def fetch_title(s: aiohttp.ClientSession, url):
+            try:
+                async with s.get(url, proxy=proxy, timeout=5) as response:
+                    html = await response.text()
+                    title_match = re.search(r'<title>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
+                    if title_match:
+                        title = title_match.group(1).strip()
+                        if "just a moment" in title.lower():
+                            title = ""
+                    else:
+                        title = ""
+                    return title
+            except (ClientConnectorError, aiohttp.client_exceptions.ClientError,  asyncio.TimeoutError):
+                return ""
+            except Exception as e:
+                logger.info(str(e))
+                return ""
+
+        parsed_url = urlparse(self.url)
+        domain = parsed_url.netloc
+        if '.' in parsed_url.netloc:
+            n = parsed_url.netloc.split('.')
+            domain2 = n[-2] + "." + n[-1]
+        else:
+            domain2 = ''
+        async with aiohttp.ClientSession(headers=_headers) as session:
+            if domain:
+                url_domain = f"{parsed_url.scheme}://{domain}"
+                logger.info(f'获取域名的站点标题: {url_domain}')
+                domain_title = await fetch_title(session, url_domain)
+
+            if not domain_title and domain2:
+                url_subdomain = f"{parsed_url.scheme}://{domain2}"
+                logger.info(f'尝试获取二级域名站点标题: {url_subdomain}')
+                domain_title = await fetch_title(session, url_subdomain)
+
+            site_title = domain_title or ""
+            return site_title
+
     @logger.catch()
     async def getSubTraffic(self, proxy=proxies):
         """
         获取订阅内的流量
         :return: str
         """
-        _headers = {'User-Agent': 'clash'}
+        _headers = config.get_ua() or {'user-agent': 'ClashMetaForAndroid/2.8.9.Meta Mihomo/0.16 Clash.Meta'}
         try:
             async with aiohttp.ClientSession(headers=_headers) as session:
                 async with session.get(self.url, proxy=proxy, timeout=20) as response:
@@ -272,10 +401,13 @@ class SubCollector(BaseCollector):
                     traffic_download = info2.get('download', 0) / 1024 / 1024 / 1024
                     traffic_use = traffic_up + traffic_download
                     traffic_total = info2.get('total', 0) / 1024 / 1024 / 1024
-                    expire_time = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(info2.get('expire', time.time())))
+                    expire = info2.get('expire', time.time())
+                    days_diff = int((expire - time.time()) // (24 * 60 * 60))
+                    expire_time = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(expire))
                     if expire_time.startswith('1970') and traffic_total and traffic_use:
                         expire_time = '长期有效'
-                return [traffic_up, traffic_download, traffic_use, traffic_total, expire_time]
+                        days_diff = 0
+                return [traffic_up, traffic_download, traffic_use, traffic_total, expire_time, days_diff]
         except asyncio.exceptions.TimeoutError:
             logger.info("获取订阅超时")
             return []
@@ -291,7 +423,7 @@ class SubCollector(BaseCollector):
         :param inmemory: 直接返回数据到内存，不保存到本地
         :return: 获得一个文件: sub.yaml, bool : True or False
         """
-        _headers = {'User-Agent': 'clash-meta'}
+        _headers = config.get_ua() or {'user-agent': 'ClashMetaForAndroid/2.8.9.Meta Mihomo/0.16 Clash.Meta'}
         # suburl = self.url
         suburl = self.cvt_url if self.cvt_enable else self.url
         cvt_text = "subconverter状态: {}".format("已启用" if self.cvt_enable else "未启用")
@@ -341,98 +473,18 @@ class SubCollector(BaseCollector):
             return False
 
 
-class Miaospeed:
-    SlaveRequestMatrixType = ['TEST_PING_RTT', 'SPEED_AVERAGE', 'UDP_TYPE', 'SPEED_PER_SECOND', 'SPEED_MAX',
-                              'GEOIP_INBOUND', 'GEOIP_OUTBOUND',
-                              'TEST_SCRIPT', 'TEST_PING_CONN', 'TEST_PING_RTT']
-    SlaveRequestMatrixEntry = [{'Type': "SPEED_AVERAGE",
-                                'Params': str({1})},
-                               {'Type': "SPEED_MAX",
-                                'Params': str({"Name": "test01", "Address": "127.0.0.1:1111", "Type": "Socks5"})},
-                               {'Type': "SPEED_PER_SECOND",
-                                'Params': str({"Name": "test01", "Address": "127.0.0.1:1111", "Type": "Socks5"})},
-                               {'Type': "UDP_TYPE",
-                                'Params': str({"Name": "test01", "Address": "127.0.0.1:1111", "Type": "Socks5"})},
-                               ]
-    SlaveRequestBasics = {'ID': '114514',
-                          'Slave': '114514miao',
-                          'SlaveName': 'miao1',
-                          'Invoker': 'FullTclash',
-                          'Version': '1.0'}
-    SlaveRequestOptions = {'Filter': '',
-                           'Matrices': SlaveRequestMatrixEntry}
-    SlaveRequestConfigs = {
-        'DownloadURL': 'https://dl.google.com/dl/android/studio/install/3.4.1.0/' +
-                       'android-studio-ide-183.5522156-windows.exe',
-        'DownloadDuration': 10,
-        'DownloadThreading': 4,
-        'PingAverageOver': 3,
-        'PingAddress': 'http://www.gstatic.com/generate_204',
-        'TaskThreading': 4,
-        'TaskRetry': 2,
-        'DNSServers': ['119.29.29.29'],
-        'TaskTimeout': 5,
-        'Scripts': []}
-    VendorType = 'Clash'
-    start_token = ''
-    SlaveRequest = {'Basics': SlaveRequestBasics,
-                    'Options': SlaveRequestOptions,
-                    'Configs': SlaveRequestConfigs,
-                    'Vendor': VendorType,
-                    'RandomSequence': 'str1',
-                    'Challenge': start_token}
-
-    def __init__(self, proxyconfig: list, host: str = '127.0.0.1', port: int = 1112, ):
-        """
-        初始化miaospeed
-        :param proxyconfig: 订阅配置的路径
-        """
-        self.host = host
-        self.port = port
-        self.nodes = proxyconfig
-        self.slaveRequestNode = [{'Name': 'test01', 'Payload': str(i)} for i in self.nodes]
-        self.SlaveRequest['Nodes'] = self.slaveRequestNode
-
-    # async def start(self):
-    #     start_time = time.strftime("%Y-%m-%dT%H-%M-%S", time.localtime())
-    #     info = []
-    #     resdata = {start_time: {}}
-    #     from async_timeout import timeout
-    #     try:
-    #         async with timeout(len(self.nodes) * 10 + 1):
-    #             async with websockets.connect(f'ws://{self.host}:{self.port}') as websocket:
-    #                 payload = json.dumps(self.SlaveRequest)
-    #                 await websocket.send(payload)
-    #                 num = 0
-    #                 while True:
-    #                     response_str = await websocket.recv()
-    #                     num += 1
-    #                     logger.info(f"已接收第{num}次结果")
-    #                     res1 = json.loads(response_str)
-    #                     info.append(res1)
-    #
-    #     except asyncio.TimeoutError:
-    #         logger.info("本次测试已完成")
-    #     except KeyboardInterrupt:
-    #         pass
-    #     finally:
-    #         resdata.update({start_time: info})
-    #         return resdata, start_time
-
-
 class Collector:
     def __init__(self, script: List[str] = None):
         self.tasks = []
+        self.start = self.collect
         self._script = script
         self._headers = {
-            'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/106.0.0.0 Safari/537.36"}
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
+                          'Chrome/123.0.0.0 Safari/537.36'}
         self._headers_json = {
-            'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+            'user-agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                           "Chrome/106.0.0.0 Safari/537.36", "Content-Type": 'application/json'}
         self.info = {}
-        self.disneyurl1 = "https://www.disneyplus.com/"
-        self.disneyurl2 = "https://global.edge.bamgrid.com/token"
 
     @logger.catch
     def create_tasks(self, session: aiohttp.ClientSession, proxy=None):
@@ -443,124 +495,25 @@ class Collector:
         :return: tasks: []
         """
         items = media_items if self._script is None else self._script
+        if len(items) == 0 or not isinstance(items, list):
+            return self.tasks
         try:
-            if len(items) and isinstance(items, list):
-                for item in items:
-                    i = item
-                    if i in addon.script:
-                        task = addon.script[i][0]
-                        self.tasks.append(task(self, session, proxy=proxy))
-                        continue
-                    if i == "Youtube":
-                        from addons.builtin import youtube
-                        self.tasks.append(youtube.task(self, session, proxy=proxy))
-                    elif i == "Disney" or i == "Disney+":
-                        task5 = asyncio.create_task(self.fetch_dis(session, proxy=proxy))
-                        self.tasks.append(task5)
-                    elif i == "Netflix":
-                        from addons.builtin import netflix
-                        self.tasks.append(netflix.task(self, session, proxy=proxy, netflixurl=netflix_url))
-                    elif i == "TVB":
-                        from addons.builtin import tvb
-                        self.tasks.append(tvb.task(self, session, proxy=proxy))
-                    elif i == "Viu":
-                        from addons.builtin import viu
-                        self.tasks.append(viu.task(self, session, proxy=proxy))
-                    elif i == "Iprisk" or i == "落地IP风险":
-                        from addons.builtin import ip_risk
-                        self.tasks.append(ip_risk.task(self, session, proxy=proxy))
-                    elif i == "steam货币":
-                        from addons.builtin import steam
-                        self.tasks.append(steam.task(self, session, proxy=proxy))
-                    elif i == "维基百科":
-                        from addons.builtin import wikipedia
-                        self.tasks.append(wikipedia.task(self, session, proxy=proxy))
-                    elif item == "OpenAI":
-                        from addons.builtin import openai
-                        self.tasks.append(openai.task(self, session, proxy=proxy))
-                    else:
-                        pass
+            for item in items:
+                i = item
+                if i in addon.script:
+                    task = addon.script[i][0]
+                    self.tasks.append(task(self, session, proxy=proxy))
+                    continue
+                else:
+                    pass
             return self.tasks
         except Exception as e:
             logger.error(e)
             return []
 
-    async def fetch_dis(self, session: aiohttp.ClientSession, proxy=None, reconnection=2):
+    async def collect(self, host: str, port: int, proxy=None):
         """
-        Disney+ 解锁检测
-        :param reconnection:
-        :param session:
-        :param proxy:
-        :return:
-        """
-        try:
-            if reconnection == 0:
-                dis1 = await session.get(self.disneyurl1, proxy=proxy, timeout=5)
-                text1 = await dis1.text()
-                dis1.close()
-                if dis1.status == 200:
-                    # text1 = await dis1.text()
-                    index = str(text1).find('Region', 0, 400)
-                    region = text1[index + 8:index + 10]
-                    if index == -1:
-                        self.info['disney'] = "待解锁"
-                    elif dis1.history:
-                        if 300 <= dis1.history[0].status <= 399:
-                            self.info['disney'] = "待解({})".format(region)
-                        else:
-                            self.info['disney'] = "未知"
-                    else:
-                        self.info['disney'] = "解锁({})".format(region)
-                elif 399 < dis1.status:
-                    self.info['disney'] = "N/A"
-                    logger.info(f"disney+ 访问错误 {dis1.status}")
-                else:
-                    self.info['disney'] = "失败"
-            else:
-                dis1 = await session.get(self.disneyurl1, proxy=proxy, timeout=5)
-                text1 = await dis1.text()
-                dis1.close()
-                dis2 = await session.get(self.disneyurl2, proxy=proxy, timeout=5)
-                if dis1.status == 200 and dis2.status != 403:
-                    # text1 = await dis1.text()
-                    index = str(text1).find('Region', 0, 400)
-                    region = text1[index + 8:index + 10]
-                    if index == -1:
-                        self.info['disney'] = "待解锁"
-                    elif dis1.history:
-                        if 300 <= dis1.history[0].status <= 399:
-                            self.info['disney'] = "待解({})".format(region)
-                        else:
-                            self.info['disney'] = "未知"
-                    else:
-                        self.info['disney'] = "解锁({})".format(region)
-                else:
-                    self.info['disney'] = "失败"
-                dis2.close()
-        except ssl.SSLError:
-            if reconnection != 0:
-                await self.fetch_dis(session=session, proxy=proxy, reconnection=reconnection - 1)
-            else:
-                self.info['disney'] = '证书错误'
-        except ClientConnectorError as c:
-            logger.warning("disney+请求发生错误:" + str(c))
-            if reconnection != 0:
-                await self.fetch_dis(session=session, proxy=proxy, reconnection=reconnection - 1)
-            else:
-                self.info['disney'] = '连接错误'
-        except asyncio.exceptions.TimeoutError:
-            logger.warning("disney+请求超时，正在重新发送请求......")
-            if reconnection != 0:
-                await self.fetch_dis(session=session, proxy=proxy, reconnection=reconnection - 1)
-        except ConnectionResetError:
-            self.info['disney'] = '未知'
-        except ProxyConnectionError as p:
-            logger.warning("似乎目标端口未开启监听")
-            logger.warning(str(p))
-
-    async def start(self, host: str, port: int, proxy=None):
-        """
-        启动采集器，采用并发操作
+        等待采集器工作完成
         :param host:
         :param port:
         :param proxy: using proxy
@@ -583,135 +536,17 @@ class Collector:
             return self.info
 
 
-async def delay(session: aiohttp.ClientSession, proxyname, testurl, hostname, port, timeout):
-    url = 'http://{}:{}/proxies/{}/delay?timeout={}&url={}'.format(hostname, port, proxyname, timeout, testurl)
-    async with session.get(url) as r:
-        try:
-            if r.status == 200:
-                text = await r.json()
-                return text['delay']
+async def get_latest_tag(username, repo):
+    import re
+    url = f'https://github.com/{username}/{repo}/tags'
+    async with ClientSession() as session:
+        async with session.get(url, proxy=config.get_proxy(), timeout=10) as r:
+            text = await r.text()
+            tags = re.findall(r'/.*?/tag/(.*?)"', text)
+            if tags:
+                return tags[0]
             else:
-                logger.info(proxyname + ":" + str(await r.json()) + str(r.status))
-                return -1
-        except ClientConnectorError as c:
-            logger.warning("连接失败:", c)
-            return -1
-
-
-async def delay_providers(providername, hostname='127.0.0.1', port=11230, session: aiohttp.ClientSession = None):
-    healthcheckurl = 'http://{}:{}/providers/proxies/{}/healthcheck'.format(hostname, port, providername)
-    url = 'http://{}:{}/providers/proxies/{}/'.format(hostname, port, providername)
-    if session is None:
-        session = aiohttp.ClientSession()
-    try:
-        await session.get(healthcheckurl)
-        async with session.get(url) as r:
-            if r.status == 200:
-                text = await r.json()
-                # 拿到延迟数据
-                delays = []
-                node = text['proxies']
-                for n in node:
-                    s = n['history'].pop()
-                    de = s['delay']
-                    delays.append(de)
-                await session.close()
-                return delays
-            else:
-                logger.warning("延迟测试出错:" + str(r.status))
-                await session.close()
-                return 0
-    except ClientConnectorError as c:
-        logger.warning("连接失败:", c)
-        await session.close()
-        return 0
-
-
-async def batch_delay(proxyname: list, session: aiohttp.ClientSession = None,
-                      testurl=config.getGstatic(),
-                      hostname='127.0.0.1', port=11230, timeout='5000'):
-    """
-    批量测试延迟，仅适用于不含providers的订阅
-    :param timeout:
-    :param port: 外部控制器端口
-    :param hostname: 主机名
-    :param testurl: 测试网址
-    :param session: 一个连接session
-    :param proxyname: 一组代理名
-    :return: list: 延迟
-    """
-    try:
-        if session is None:
-            async with aiohttp.ClientSession() as session:
-                tasks = []
-                for name in proxyname:
-                    task = asyncio.create_task(
-                        delay(session, name, testurl=testurl, hostname=hostname, port=port, timeout=timeout))
-                    tasks.append(task)
-                done = await asyncio.gather(*tasks)
-                return done
-        else:
-            tasks = []
-            for name in proxyname:
-                task = asyncio.create_task(
-                    delay(session, name, testurl=testurl, hostname=hostname, port=port, timeout=timeout))
-                tasks.append(task)
-            done = await asyncio.gather(*tasks)
-            return done
-    except Exception as e:
-        logger.error(e)
-        return None
-
-
-async def delay_https(session: aiohttp.ClientSession, proxy=None, testurl=config.getGstatic(),
-                      timeout=10):
-    # _headers = {
-    #     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
-    #                   'Chrome/102.0.5005.63 Safari/537.36'
-    # }
-    _headers2 = {'User-Agent': 'clash'}
-    try:
-        s1 = time.time()
-        async with session.get(url=testurl, proxy=proxy, headers=_headers2,
-                               timeout=timeout) as r:
-            if r.status == 502:
-                pass
-                # logger.error("dual stack tcp shake hands failed")
-            if r.status == 204 or r.status == 200:
-                delay1 = time.time() - s1
-                # print(delay1)
-                return delay1
-            else:
-                return 0
-    except Exception as e:
-        logger.error(str(e))
-        return 0
-
-
-async def delay_https_task(session: aiohttp.ClientSession = None, collector=None, proxy=None, times=5):
-    if session is None:
-        async with aiohttp.ClientSession() as session:
-            tasks = [asyncio.create_task(delay_https(session=session, proxy=proxy)) for _ in range(times)]
-            result = await asyncio.gather(*tasks)
-            sum_num = [r for r in result if r != 0]
-            http_delay = sum(sum_num) / len(sum_num) if len(sum_num) else 0
-            http_delay = "%.0fms" % (http_delay * 1000)
-            # print("http平均延迟:", http_delay)
-            http_delay = int(http_delay[:-2])
-            if collector is not None:
-                collector.info['HTTP(S)延迟'] = http_delay
-            return http_delay
-    else:
-        tasks = [asyncio.create_task(delay_https(session=session, proxy=proxy)) for _ in range(times)]
-        result = await asyncio.gather(*tasks)
-        sum_num = [r for r in result if r != 0]
-        http_delay = sum(sum_num) / len(sum_num) if len(sum_num) else 0
-        http_delay = "%.0fms" % (http_delay * 1000)
-        http_delay = int(http_delay[:-2])
-        # print("http平均延迟:", http_delay)
-        if collector is not None:
-            collector.info['HTTP(S)延迟'] = http_delay
-        return http_delay
+                return None
 
 
 if __name__ == "__main__":
